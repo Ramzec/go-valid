@@ -86,10 +86,7 @@ func Validate(inputData map[string]*json.RawMessage, outputStruct interface{}) e
 			continue
 		}
 
-		fValue := outValue.Elem().FieldByName(structField.Name)
-		if fValue.Kind() != reflect.Ptr {
-			fValue = fValue.Addr()
-		}
+		fValue := outValue.Elem().FieldByName(structField.Name).Addr()
 
 		errDecode := json.Unmarshal(*val, fValue.Interface())
 		if errDecode != nil {
