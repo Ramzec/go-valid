@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -16,12 +17,23 @@ const VALIDATE_TAG_NAME = "validate"
 const (
 	TAG_FIELD_NAME     = "name"
 	TAG_FIELD_REQUIRED = "required"
+	TAG_FIELD_MAX      = "max"
+	TAG_FIELD_MIN      = "min"
+	TAG_FIELD_MAX_LEN  = "maxLen"
+	TAG_FIELD_MIN_LEN  = "minLen"
+	TAG_FIELD_DEFAULT  = "default"
+	TAG_FIELD_ONE_OF   = "oneof"
 )
 
 const (
 	VALIDATE_ERR_CODE_UNKNOWN = iota
 	VALIDATE_ERR_CODE_MISSING_REQ_PARAM
 	VALIDATE_ERR_CODE_UNPARSABLE
+	VALIDATE_ERR_CODE_TOO_LONG
+	VALIDATE_ERR_CODE_TOO_SHORT
+	VALIDATE_ERR_CODE_TOO_BIG
+	VALIDATE_ERR_CODE_TOO_SMALL
+	VALIDATE_ERR_CODE_INVALID
 )
 
 type ValidateError struct {
@@ -32,6 +44,10 @@ type ValidateError struct {
 
 func (e *ValidateError) Error() string {
 	if e.OriginalError == nil {
+		switch e.Code {
+		case VALIDATE_ERR_CODE_UNPARSABLE:
+			return fmt.Sprintf("Param '%s' is invalid or corrupted", e.ParamName)
+		}
 		return ""
 	}
 
@@ -71,6 +87,7 @@ func Validate(inputData map[string]*json.RawMessage, outputStruct interface{}) e
 			panic(fmt.Sprintf("Field '%s': empty tag", structField.Name))
 		}
 
+		fValue := outValue.Elem().FieldByName(structField.Name)
 		vParams := decodeTagFields(tagFieldsRaw)
 
 		val, ok := inputData[vParams.Name]
@@ -79,33 +96,164 @@ func Validate(inputData map[string]*json.RawMessage, outputStruct interface{}) e
 				return &ValidateError{
 					ParamName:     vParams.Name,
 					Code:          VALIDATE_ERR_CODE_MISSING_REQ_PARAM,
-					OriginalError: nil,
+					OriginalError: fmt.Errorf("Param '%s' is required", vParams.Name),
 				}
 			}
 
-			continue
-		}
-
-		fValue := outValue.Elem().FieldByName(structField.Name).Addr()
-
-		errDecode := json.Unmarshal(*val, fValue.Interface())
-		if errDecode != nil {
-			return &ValidateError{
-				ParamName:     vParams.Name,
-				Code:          VALIDATE_ERR_CODE_UNPARSABLE,
-				OriginalError: errDecode,
+			if v, ok := vParams.Fields[TAG_FIELD_DEFAULT]; ok {
+				setDefaultValue(fValue.Addr(), v)
+			} else {
+				continue
+			}
+		} else {
+			errDecode := json.Unmarshal(*val, fValue.Addr().Interface())
+			if errDecode != nil {
+				return &ValidateError{
+					ParamName:     vParams.Name,
+					Code:          VALIDATE_ERR_CODE_UNPARSABLE,
+					OriginalError: errDecode,
+				}
 			}
 		}
 
-		for name, _ := range vParams.Fields {
-			switch name {
+		for tagName, tagRawVal := range vParams.Fields {
+			switch tagName {
+			case TAG_FIELD_MIN, TAG_FIELD_MAX:
+				valErr := ValidateError{
+					ParamName:     vParams.Name,
+					Code:          VALIDATE_ERR_CODE_UNKNOWN,
+					OriginalError: nil,
+				}
+				var val interface{}
+				var err error
+				switch fValue.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int32, reflect.Int64:
+					val, err = strconv.ParseInt(tagRawVal, 10, 64)
+					if err != nil {
+						panic(fmt.Sprintf("Unable to parse '%s' tag as a signed integer", tagName))
+					}
+
+					if tagName == TAG_FIELD_MIN && fValue.Int() < val.(int64) {
+						valErr.Code = VALIDATE_ERR_CODE_TOO_SMALL
+					}
+
+					if tagName == TAG_FIELD_MAX && fValue.Int() > val.(int64) {
+						valErr.Code = VALIDATE_ERR_CODE_TOO_BIG
+					}
+				case reflect.Uint, reflect.Uint8, reflect.Uint32, reflect.Uint64:
+					val, err = strconv.ParseUint(tagRawVal, 10, 64)
+					if err != nil {
+						panic(fmt.Sprintf("Unable to parse '%s' tag as a unsigned integer", tagName))
+					}
+
+					if tagName == TAG_FIELD_MIN && fValue.Uint() < val.(uint64) {
+						valErr.Code = VALIDATE_ERR_CODE_TOO_SMALL
+					}
+
+					if tagName == TAG_FIELD_MAX && fValue.Uint() > val.(uint64) {
+						valErr.Code = VALIDATE_ERR_CODE_TOO_BIG
+					}
+				case reflect.Float32, reflect.Float64:
+					val, err = strconv.ParseFloat(tagRawVal, 64)
+					if err != nil {
+						panic(fmt.Sprintf("Unable to parse default (%s) as a float: %s", tagRawVal, err.Error()))
+					}
+
+					if tagName == TAG_FIELD_MIN && fValue.Float() < val.(float64) {
+						valErr.Code = VALIDATE_ERR_CODE_TOO_SMALL
+					}
+
+					if tagName == TAG_FIELD_MAX && fValue.Float() > val.(float64) {
+						valErr.Code = VALIDATE_ERR_CODE_TOO_BIG
+					}
+				default:
+					panic(fmt.Sprintf("Tag '%s' cannot be applied to field '%s'. "+
+						"The field is not an integer or float", tagName, structField.Name))
+				}
+
+				switch valErr.Code {
+				case VALIDATE_ERR_CODE_TOO_SMALL:
+					valErr.OriginalError = fmt.Errorf("Param '%s' is too small (< %v)", valErr.ParamName, val)
+				case VALIDATE_ERR_CODE_TOO_BIG:
+					valErr.OriginalError = fmt.Errorf("Param '%s' is too big (> %v)", valErr.ParamName, val)
+				}
+			case TAG_FIELD_MIN_LEN, TAG_FIELD_MAX_LEN:
+				if fValue.Kind() != reflect.String {
+					panic(fmt.Sprintf("Tag '%s' cannot be applied to field '%s'. "+
+						"The field is not a string", tagName, structField.Name))
+				}
+
+				reqLen, err := strconv.ParseUint(tagRawVal, 10, 64)
+				if err != nil {
+					panic(fmt.Sprintf("Unable to parse '%s' tag as an unsigned integer", tagName))
+				}
+
+				if tagName == TAG_FIELD_MAX_LEN && len(fValue.String()) > int(reqLen) {
+					return &ValidateError{
+						ParamName:     vParams.Name,
+						Code:          VALIDATE_ERR_CODE_TOO_LONG,
+						OriginalError: fmt.Errorf("Param '%s' is too long (> %d)", vParams.Name, reqLen),
+					}
+				}
+
+				if tagName == TAG_FIELD_MIN_LEN && len(fValue.String()) < int(reqLen) {
+					return &ValidateError{
+						ParamName:     vParams.Name,
+						Code:          VALIDATE_ERR_CODE_TOO_SHORT,
+						OriginalError: fmt.Errorf("Param '%s' is too short (< %d)", vParams.Name, reqLen),
+					}
+				}
+			case TAG_FIELD_ONE_OF:
+
+			case TAG_FIELD_DEFAULT:
+				// This tag already processed
 			default:
-				panic(fmt.Sprintf("Unknown tag field: '%s'", name))
+				panic(fmt.Sprintf("Unknown tag field: '%s'", tagName))
 			}
 		}
 	}
 
 	return nil
+}
+
+func setDefaultValue(fieldPtr reflect.Value, rawValue string) {
+
+	field := reflect.Indirect(fieldPtr)
+	kind := field.Kind()
+	switch kind {
+	case reflect.Uint:
+		val, err := strconv.ParseUint(rawValue, 10, 64)
+		if err != nil {
+			panic(fmt.Sprintf("Unable to parse default (%s) as an unsigned integer: %s", rawValue, err.Error()))
+		}
+
+		field.SetUint(val)
+	case reflect.Int:
+		val, err := strconv.ParseInt(rawValue, 10, 64)
+		if err != nil {
+			panic(fmt.Sprintf("Unable to parse default (%s) as a signed integer: %s", rawValue, err.Error()))
+		}
+
+		field.SetInt(val)
+	case reflect.Float32:
+		val, err := strconv.ParseFloat(rawValue, 32)
+		if err != nil {
+			panic(fmt.Sprintf("Unable to parse default (%s) as a float32: %s", rawValue, err.Error()))
+		}
+
+		field.SetFloat(float64(val))
+	case reflect.Float64:
+		val, err := strconv.ParseFloat(rawValue, 64)
+		if err != nil {
+			panic(fmt.Sprintf("Unable to parse default (%s) as a float64: %s", rawValue, err.Error()))
+		}
+
+		field.SetFloat(val)
+	case reflect.String:
+		field.SetString(rawValue)
+	default:
+		panic(fmt.Sprintf("Unsupported kind of value: %s", kind.String()))
+	}
 }
 
 func decodeTagFields(tagFieldsRaw []string) FieldValidationParams {
